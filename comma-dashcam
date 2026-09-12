@@ -1,0 +1,347 @@
+#!/usr/bin/env bash
+# Pull comma / openpilot dashcam footage over the local network and
+# stitch each drive into QuickTime-playable MP4s. Nothing is uploaded.
+set -euo pipefail
+
+HOST="${COMMA_HOST:-comma}"
+REMOTE_PATH="${COMMA_REMOTE_PATH:-/data/media/0/realdata/}"
+if [ -z "${COMMA_DEST:-}" ] && [ -f "$HOME/.config/comma-dashcam.json" ]; then
+  ROOT="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('dest') or '')" "$HOME/.config/comma-dashcam.json" 2>/dev/null || true)"
+fi
+ROOT="${COMMA_DEST:-${ROOT:-$HOME/Movies/comma}}"
+RAW="$ROOT/raw"
+VIDEOS="$ROOT/videos"
+FPS="${COMMA_FPS:-20}"
+# Road-facing cameras only. Set COMMA_CAMERAS="fcamera ecamera dcamera" for cabin too.
+CAMERAS="${COMMA_CAMERAS:-fcamera ecamera}"
+SKIP_SECS="${COMMA_SKIP_SECS:-120}"
+SSH_KEY="${COMMA_SSH_KEY:-$HOME/.ssh/id_ed25519}"
+SSH_CONFIG="$HOME/.ssh/config"
+
+usage() {
+  cat <<'EOF'
+Usage: comma-dashcam <command>
+
+  setup     Add the SSH host and check that this Mac can log in
+  status    Show device reachability and local footage
+  pull      Download new road-camera segments (incremental)
+  stitch    Turn downloaded drives into MP4s
+  sync      pull + stitch
+
+Footage lands in ~/Movies/comma/videos. Raw HEVC stays in ~/Movies/comma/raw.
+
+Environment:
+  COMMA_HOST      SSH host alias (default: comma)
+  COMMA_MDNS      Device name, such as comma-xxxxxx.local, used the first time setup writes the SSH host
+  COMMA_DEST      Local library (default: ~/Movies/comma)
+  COMMA_CAMERAS   Space-separated cameras (default: fcamera ecamera)
+EOF
+}
+
+is_mac() { [ "$(uname -s)" = "Darwin" ]; }
+
+mtime() {
+  if is_mac; then stat -f %m "$1"; else stat -c %Y "$1"; fi
+}
+
+file_ok() {
+  [ -f "$1" ] || return 1
+  local d
+  d="$(ffprobe -v error -show_entries format=duration -of default=nk=1:nw=1 "$1" 2>/dev/null | head -1)"
+  awk -v d="$d" 'BEGIN { exit !(d + 0 > 0) }'
+}
+
+label_for() {
+  case "$1" in
+    fcamera) echo "road" ;;
+    ecamera) echo "wide" ;;
+    dcamera) echo "driver" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+route_from_seg() {
+  printf '%s\n' "$1" | sed -E 's/--[0-9]+$//'
+}
+
+is_segment_dir() {
+  # date-style (2024-01-01--12-00-00--0) or newer (00000044--hash--0)
+  printf '%s\n' "$1" | grep -Eq -- '--[0-9]+$'
+}
+
+ssh_base() {
+  echo "ssh -i ${SSH_KEY} -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=15 -o ServerAliveCountMax=6 -o StrictHostKeyChecking=accept-new"
+}
+
+# Device name for a reachability check. Setup stores it in ~/.ssh/config; it is not kept in this repo.
+device_name() {
+  if [ -n "${COMMA_MDNS:-}" ]; then
+    printf '%s\n' "$COMMA_MDNS"
+    return 0
+  fi
+  awk '
+    /^[Hh]ost[[:space:]]/ {
+      hit = 0
+      for (i = 2; i <= NF; i++) if ($i == "comma") hit = 1
+    }
+    hit && /^[[:space:]]*[Hh]ost[Nn]ame[[:space:]]/ { print $2; exit }
+  ' "$SSH_CONFIG" 2>/dev/null
+}
+
+remote() {
+  # shellcheck disable=SC2046
+  $(ssh_base) "$HOST" "$@"
+}
+
+ensure_dirs() {
+  mkdir -p "$RAW" "$VIDEOS"
+}
+
+ensure_tools() {
+  command -v rsync >/dev/null || { echo "rsync is required." >&2; exit 1; }
+  command -v ffmpeg >/dev/null || { echo "ffmpeg is required. Install with: brew install ffmpeg" >&2; exit 1; }
+  command -v ffprobe >/dev/null || { echo "ffprobe is required (comes with ffmpeg)." >&2; exit 1; }
+}
+
+list_local_routes() {
+  find "$RAW" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null \
+    | while IFS= read -r name; do
+        is_segment_dir "$name" || continue
+        route_from_seg "$name"
+      done | sort -u
+}
+
+route_newest() {
+  local route="$1" newest=0 t f
+  for f in "$RAW/${route}--"*; do
+    [ -d "$f" ] || continue
+    t="$(mtime "$f")"
+    [ "$t" -gt "$newest" ] && newest="$t"
+  done
+  echo "$newest"
+}
+
+still_recording() {
+  local newest now
+  newest="$(route_newest "$1")"
+  [ "$newest" -gt 0 ] || return 1
+  now="$(date +%s)"
+  [ $((now - newest)) -lt "$SKIP_SECS" ]
+}
+
+cmd_setup() {
+  mkdir -p "$HOME/.ssh"
+  chmod 700 "$HOME/.ssh"
+  if [ ! -f "$SSH_KEY" ]; then
+    echo "No SSH key at $SSH_KEY — creating one."
+    ssh-keygen -t ed25519 -f "$SSH_KEY" -N "" -C "$(whoami)@$(hostname -s)-comma"
+  fi
+
+  if ! grep -qE '^Host[[:space:]]+comma([[:space:]]|$)' "$SSH_CONFIG" 2>/dev/null; then
+    local name
+    name="$(device_name || true)"
+    if [ -z "$name" ]; then
+      echo "Set COMMA_MDNS to the name on the comma's Wi-Fi screen, then run setup again:" >&2
+      echo "  COMMA_MDNS=comma-xxxxxx.local ./comma-dashcam setup" >&2
+      return 1
+    fi
+    cat >> "$SSH_CONFIG" <<EOF
+
+# comma device — dashcam pull (mDNS survives DHCP)
+Host comma
+    HostName ${name}
+    User comma
+    Port 22
+    IdentityFile ${SSH_KEY}
+    IdentitiesOnly yes
+    StrictHostKeyChecking accept-new
+    ServerAliveInterval 60
+    ServerAliveCountMax 10
+EOF
+    echo "Added SSH host 'comma' -> ${name}"
+  else
+    echo "SSH host 'comma' is already in $SSH_CONFIG"
+  fi
+
+  if is_mac; then
+    pbcopy < "${SSH_KEY}.pub"
+    echo "Copied this Mac's public key to the clipboard."
+  fi
+
+  echo
+  echo "Add this Mac's public key to your GitHub account, then point the comma at that account."
+  echo
+  echo "  1. GitHub → Settings → SSH keys → New SSH key"
+  echo "     Title: comma dashcam"
+  echo "     Key (already copied if you are on a Mac):"
+  echo
+  sed 's/^/     /' "${SSH_KEY}.pub"
+  echo
+  echo "  2. On the comma: Settings → Network → Advanced"
+  echo "     Enable SSH. The device name looks like comma-xxxxxx.local."
+  echo "     SSH Keys → Add → your GitHub username"
+  echo "     If a username is already there, Remove then Add again so it re-fetches keys."
+  echo
+  echo "  3. Optional, stay local: turn off raw / route uploads in those same network settings"
+  echo "     so footage is not sent to connect.comma.ai."
+  echo
+  echo "Then run:  ./comma-dashcam setup   (again, to test login)"
+  echo "           ./comma-dashcam sync"
+  echo
+
+  if remote 'test -d /data/media/0/realdata' 2>/dev/null; then
+    echo "SSH is working. Device is reachable."
+    remote 'echo "  host: $(hostname)"; echo "  disk: $(df -h /data/media/0 | awk "NR==2{print \$4 \" free of \" \$2}")"; echo "  segments: $(ls -1d /data/media/0/realdata/*--* 2>/dev/null | wc -l | tr -d " ")"'
+  else
+    echo "SSH login is not working yet (the device is on the network; the key is not)."
+    echo "Finish steps 1–2 above, then re-run setup."
+    return 1
+  fi
+}
+
+cmd_status() {
+  ensure_dirs
+  echo "Library:  $ROOT"
+  echo "Host:     $HOST"
+  local name
+  name="$(device_name || true)"
+  if [ -z "$name" ]; then
+    echo "Network:  no device name yet. Example: COMMA_MDNS=comma-xxxxxx.local ./comma-dashcam setup"
+  elif ping -c 1 -W 1000 "$name" >/dev/null 2>&1; then
+    echo "Network:  ${name} is up"
+  else
+    echo "Network:  ${name} is not responding (car off / other Wi‑Fi?)"
+  fi
+  if remote 'test -d /data/media/0/realdata' 2>/dev/null; then
+    echo "SSH:      ok"
+    remote 'echo "Device:   $(hostname)"; echo "Footage:  $(ls -1d /data/media/0/realdata/*--* 2>/dev/null | wc -l | tr -d " ") segments on device"'
+  else
+    echo "SSH:      not authorized yet — run ./comma-dashcam setup"
+  fi
+  echo "Local:    $(list_local_routes | grep -c . || true) drives downloaded"
+  echo "Videos:   $(find "$VIDEOS" -name '*.mp4' 2>/dev/null | grep -c . || true) MP4s"
+}
+
+cmd_pull() {
+  ensure_tools
+  ensure_dirs
+  if ! remote 'test -d /data/media/0/realdata' 2>/dev/null; then
+    echo "Can't log into the comma. Run ./comma-dashcam setup first." >&2
+    return 1
+  fi
+
+  local includes="" cam
+  for cam in $CAMERAS; do
+    includes="$includes --include=${cam}.hevc"
+  done
+
+  echo "Pulling ${CAMERAS} from ${HOST}:${REMOTE_PATH}"
+  echo "into ${RAW}"
+  # Incremental: rsync only copies missing or newer files.
+  # --partial keeps interrupted transfers so the next run resumes.
+  local rsync_bin
+  rsync_bin="$(command -v /opt/homebrew/bin/rsync || command -v rsync)"
+  "$rsync_bin" -a --partial --info=progress2 --prune-empty-dirs \
+    --include='*/' \
+    $includes \
+    --exclude='*' \
+    -e "$(ssh_base)" \
+    "${HOST}:${REMOTE_PATH}" "$RAW/"
+  echo "Pull finished."
+}
+
+stitch_route() {
+  local route="$1" cam segs combined out lbl tmpd rc
+  if still_recording "$route"; then
+    echo "Skipping ${route} (still recording; will pick it up next sync)"
+    return 0
+  fi
+
+  tmpd="$(mktemp -d "${TMPDIR:-/tmp}/comma-dashcam.XXXXXX")"
+  segs="$(find "$RAW" -mindepth 1 -maxdepth 1 -type d -name "${route}--*" -exec basename {} \; \
+    | while IFS= read -r d; do printf '%s\t%s\n' "${d##*--}" "$d"; done \
+    | sort -n -k1,1 | cut -f2)"
+
+  if [ -z "$segs" ]; then
+    rm -rf "$tmpd"
+    return 0
+  fi
+
+  echo "Stitching ${route}"
+  for cam in $CAMERAS; do
+    lbl="$(label_for "$cam")"
+    out="$VIDEOS/${route}__${lbl}.mp4"
+    if file_ok "$out"; then
+      echo "  ${lbl}: already have $(basename "$out")"
+      continue
+    fi
+
+    combined="$tmpd/${cam}.hevc"
+    rm -f "$combined"
+    while IFS= read -r seg; do
+      [ -n "$seg" ] || continue
+      [ -f "$RAW/$seg/${cam}.hevc" ] && cat "$RAW/$seg/${cam}.hevc" >> "$combined"
+    done <<EOF
+$segs
+EOF
+    if [ ! -s "$combined" ]; then
+      echo "  ${lbl}: no ${cam}.hevc in this drive"
+      continue
+    fi
+
+    rc=0
+    ffmpeg -y -hide_banner -loglevel error \
+      -framerate "$FPS" -i "$combined" \
+      -c copy -tag:v hvc1 -movflags +faststart \
+      "${out}.part" || rc=$?
+    if [ "$rc" -eq 0 ] && file_ok "${out}.part"; then
+      mv -f "${out}.part" "$out"
+      echo "  ${lbl}: $(basename "$out")"
+    else
+      rm -f "${out}.part"
+      echo "  ${lbl}: ffmpeg failed"
+    fi
+  done
+  rm -rf "$tmpd"
+}
+
+cmd_stitch() {
+  ensure_tools
+  ensure_dirs
+  local route count=0
+  while IFS= read -r route; do
+    [ -n "$route" ] || continue
+    stitch_route "$route"
+    count=$((count + 1))
+  done <<EOF
+$(list_local_routes)
+EOF
+  if [ "$count" -eq 0 ]; then
+    echo "Nothing to stitch. Pull footage first."
+  else
+    echo "Videos are in ${VIDEOS}"
+    if is_mac; then open "$VIDEOS"; fi
+  fi
+}
+
+cmd_sync() {
+  local caff_pid=""
+  if is_mac && command -v caffeinate >/dev/null; then
+    caffeinate -i -m -w $$ >/dev/null 2>&1 &
+    caff_pid=$!
+  fi
+  cmd_pull
+  cmd_stitch
+  [ -n "$caff_pid" ] && kill "$caff_pid" >/dev/null 2>&1 || true
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  setup)  cmd_setup ;;
+  status) cmd_status ;;
+  pull)   cmd_pull ;;
+  stitch) cmd_stitch ;;
+  sync)   cmd_sync ;;
+  -h|--help|help|"") usage; [ -n "$cmd" ] || exit 1 ;;
+  *) echo "Unknown command: $cmd" >&2; usage; exit 1 ;;
+esac
